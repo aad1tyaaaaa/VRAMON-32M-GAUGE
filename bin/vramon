@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# VRAMON-32M-GAUGE - Visual Resource Monitoring for RAM & VRAM
+set -Eeuo pipefail
+
+VRAMON_VERSION="1.0.0"
+
+EXIT_OK=0
+EXIT_ERROR=1
+EXIT_USAGE=2
+EXIT_PLATFORM=3
+EXIT_CONFIG=4
+EXIT_COLLECTOR=5
+
+die() {
+    local code="$1"
+    shift
+    printf 'vramon: %s\n' "$*" >&2
+    exit "$code"
+}
+
+# Locate the directory containing lib/ (repository checkout or installed share dir).
+vramon_find_root() {
+    local src="${BASH_SOURCE[0]}" dir link candidate
+
+    if [ -n "${VRAMON_ROOT:-}" ] && [ -f "$VRAMON_ROOT/lib/metrics.sh" ]; then
+        printf '%s' "$VRAMON_ROOT"
+        return 0
+    fi
+
+    case "$src" in */*) ;; *) src="./$src" ;; esac
+    while [ -L "$src" ]; do
+        link=$(readlink "$src")
+        case "$link" in
+            /*) src="$link" ;;
+            *) src="${src%/*}/$link" ;;
+        esac
+    done
+    dir=$(cd "${src%/*}" && pwd) || return 1
+
+    for candidate in "$dir/.." "$dir/../share/vramon"; do
+        if [ -f "$candidate/lib/metrics.sh" ]; then
+            (cd "$candidate" && pwd)
+            return 0
+        fi
+    done
+    return 1
+}
+
+VRAMON_ROOT=$(vramon_find_root) || die "$EXIT_ERROR" "cannot locate VRAMON library files (set VRAMON_ROOT)"
+
+# shellcheck source=../lib/platform.sh
+source "$VRAMON_ROOT/lib/platform.sh"
+# shellcheck source=../lib/memory.sh
+source "$VRAMON_ROOT/lib/memory.sh"
+# shellcheck source=../lib/gpu.sh
+source "$VRAMON_ROOT/lib/gpu.sh"
+# shellcheck source=../lib/metrics.sh
+source "$VRAMON_ROOT/lib/metrics.sh"
+# shellcheck source=../lib/renderer.sh
+source "$VRAMON_ROOT/lib/renderer.sh"
+# shellcheck source=../lib/config.sh
+source "$VRAMON_ROOT/lib/config.sh"
+
+usage() {
+    cat <<EOF
+Usage: vramon [OPTIONS]
+
+VRAMON-32M-GAUGE - Visual Resource Monitoring for RAM & VRAM
+
+Options:
+  --once         Print one snapshot and exit (default)
+  --watch        Continuously monitor, refreshing every --interval seconds
+  --compact      Compact gauge output
+  --tmux         One-line plain output for tmux status bars
+  --json         Machine-readable JSON output
+  --no-color     Disable ANSI colors
+  --width N      Gauge width, 1-${VRAMON_MAX_WIDTH} (default: 20)
+  --interval N   Refresh interval in seconds (default: 2)
+  -h, --help     Show this help
+  -V, --version  Show version
+
+Configuration (lowest to highest precedence):
+  built-in defaults, ~/.config/vramon/config, ./.vramonrc,
+  environment variables, command-line options.
+
+  VRAMON_INTERVAL=2  VRAMON_WIDTH=20  VRAMON_WARN=30
+  VRAMON_CRITICAL=10 VRAMON_COLOR=1   (NO_COLOR is also honored)
+
+Exit codes:
+  0 success, 1 general error, 2 invalid argument, 3 unsupported platform,
+  4 configuration error, 5 collector error
+EOF
+}
+
+MODE="full"
+WATCH=0
+CLI_WIDTH=""
+CLI_INTERVAL=""
+CLI_NO_COLOR=0
+
+# set_option NAME VALUE
+set_option() {
+    case "$1" in
+        --width)
+            valid_width "$2" || die "$EXIT_USAGE" "invalid --width: '$2' (expected 1-${VRAMON_MAX_WIDTH})"
+            CLI_WIDTH="$2"
+            ;;
+        --interval)
+            valid_interval "$2" || die "$EXIT_USAGE" "invalid --interval: '$2' (expected a positive number)"
+            CLI_INTERVAL="$2"
+            ;;
+    esac
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --once) WATCH=0 ;;
+            --watch) WATCH=1 ;;
+            --compact) MODE="compact" ;;
+            --tmux) MODE="tmux" ;;
+            --json) MODE="json" ;;
+            --no-color) CLI_NO_COLOR=1 ;;
+            --width | --interval)
+                [ "$#" -ge 2 ] || die "$EXIT_USAGE" "option $1 requires a value"
+                set_option "$1" "$2"
+                shift
+                ;;
+            --width=* | --interval=*) set_option "${1%%=*}" "${1#*=}" ;;
+            -h | --help)
+                usage
+                exit "$EXIT_OK"
+                ;;
+            -V | --version)
+                printf 'VRAMON-32M-GAUGE v%s\n' "$VRAMON_VERSION"
+                exit "$EXIT_OK"
+                ;;
+            *) die "$EXIT_USAGE" "unknown option: $1 (see --help)" ;;
+        esac
+        shift
+    done
+}
+
+collect_all() {
+    collect_memory "$OS" || return 1
+    if ! collect_gpu "$GPU_BACKEND_DETECTED"; then
+        gpu_reset
+    fi
+    metrics_calculate
+}
+
+render_output() {
+    case "$MODE" in
+        compact) render_compact ;;
+        tmux) render_tmux ;;
+        json) render_json ;;
+        *) render_full ;;
+    esac
+}
+
+# shellcheck disable=SC2317
+cleanup() {
+    printf '\033[0m\033[?25h\n'
+}
+
+run_watch() {
+    local frame nl=$'\n' el=$'\033[K\n' interactive=0
+
+    if [ -t 1 ] && { [ "$MODE" = "full" ] || [ "$MODE" = "compact" ]; }; then
+        interactive=1
+        trap cleanup EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        printf '\033[?25l\033[2J\033[H'
+    fi
+
+    while true; do
+        collect_all || die "$EXIT_COLLECTOR" "failed to collect memory metrics"
+        if [ "$interactive" = "1" ]; then
+            frame=$(
+                render_output
+                printf '\nRefreshing every %ss - press Ctrl+C to exit' "$VRAMON_INTERVAL"
+            )
+            printf '\033[H%s\033[K\033[J' "${frame//$nl/$el}"
+        else
+            render_output
+        fi
+        sleep "$VRAMON_INTERVAL"
+    done
+}
+
+main() {
+    parse_args "$@"
+
+    config_load || exit "$EXIT_CONFIG"
+    if [ -n "$CLI_WIDTH" ]; then VRAMON_WIDTH="$CLI_WIDTH"; fi
+    if [ -n "$CLI_INTERVAL" ]; then VRAMON_INTERVAL="$CLI_INTERVAL"; fi
+    if [ "$CLI_NO_COLOR" = "1" ]; then VRAMON_COLOR=0; fi
+    config_validate || exit "$EXIT_CONFIG"
+
+    OS=$(detect_os)
+    if [ "$OS" = "unknown" ]; then
+        die "$EXIT_PLATFORM" "unsupported platform: $(uname -s 2>/dev/null || echo unknown) (Linux and macOS are supported)"
+    fi
+    GPU_BACKEND_DETECTED=$(detect_gpu_backend)
+
+    local use_color=0
+    if [ "$VRAMON_COLOR" = "1" ] && [ -z "${NO_COLOR:-}" ] && [ -t 1 ] &&
+        [ "$MODE" != "tmux" ] && [ "$MODE" != "json" ]; then
+        use_color=1
+    fi
+    renderer_init "$use_color"
+
+    if [ "$WATCH" = "1" ]; then
+        run_watch
+    else
+        collect_all || die "$EXIT_COLLECTOR" "failed to collect memory metrics"
+        render_output
+    fi
+}
+
+main "$@"

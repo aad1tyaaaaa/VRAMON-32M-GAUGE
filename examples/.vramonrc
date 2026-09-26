@@ -1,0 +1,16 @@
+# VRAMON configuration.
+# Copy to ~/.config/vramon/config (global) or ./.vramonrc (project-local).
+# Only simple KEY=value assignments are allowed; the file is parsed, never executed.
+
+# Refresh interval for --watch, in seconds.
+VRAMON_INTERVAL=2
+
+# Gauge width in characters (compact mode uses half).
+VRAMON_WIDTH=20
+
+# Headroom thresholds in percent: above WARN is GREEN, below CRITICAL is RED.
+VRAMON_WARN=30
+VRAMON_CRITICAL=10
+
+# 1 = ANSI colors when writing to a terminal, 0 = never.
+VRAMON_COLOR=1
